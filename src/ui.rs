@@ -20,7 +20,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(1),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ])
         .split(frame.area());
 
@@ -456,15 +456,24 @@ fn group_lines(app: &App, lines: &[TextLine]) -> Vec<String> {
 }
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let text = format!(
-        "Esc/Ctrl-C quit | Enter history | Ctrl-Up/Down history | Alt-Left/Right resize | F4 grep:{} | F8/F9 match | flags {} | {} | loaded line index: {}",
+    let tail = app
+        .export_status
+        .clone()
+        .unwrap_or_else(|| format!("loaded line index: {}", app.file.known_lines()));
+    let shortcuts = format!(
+        "Esc/Ctrl-C quit | Enter history | Ctrl-Up/Down hist | Alt-Left/Right resize | F4 grep:{} | F8/F9 match",
         if app.collapse_matches { "on" } else { "off" },
+    );
+    let state = format!(
+        "Alt-E export:{} | Ctrl-E export | flags {} | {} | {}",
+        app.export_format.label(),
         app.flags.label(),
         app.match_index.progress_label(),
-        app.file.known_lines()
+        tail
     );
     frame.render_widget(
-        Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(vec![Line::from(shortcuts), Line::from(state)])
+            .style(Style::default().fg(Color::DarkGray)),
         area,
     );
 }

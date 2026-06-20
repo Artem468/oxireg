@@ -11,6 +11,7 @@ use regex::Regex;
 
 use crate::{
     explain,
+    export::{self, ExportFormat},
     file_view::{FileView, VIEW_MARGIN_LINES},
     match_index::MatchIndex,
     regex_debug::{RegexFlags, capture_descriptions, compile_regex},
@@ -35,6 +36,8 @@ pub struct App {
     pub right_panel_percent: u16,
     pub frequency_area: Rect,
     pub status_area: Rect,
+    pub export_format: ExportFormat,
+    pub export_status: Option<String>,
     pub should_quit: bool,
     history: Vec<String>,
     history_cursor: Option<usize>,
@@ -61,6 +64,8 @@ impl App {
             right_panel_percent: 32,
             frequency_area: Rect::default(),
             status_area: Rect::default(),
+            export_format: ExportFormat::Json,
+            export_status: None,
             should_quit: false,
             history: Vec::new(),
             history_cursor: None,
@@ -161,6 +166,19 @@ impl App {
                 modifiers: KeyModifiers::ALT,
                 ..
             } => self.jump_to_prev_match()?,
+            KeyEvent {
+                code: KeyCode::Char('e'),
+                modifiers: KeyModifiers::ALT,
+                ..
+            } => {
+                self.export_format = self.export_format.next();
+                self.export_status = Some(format!("export format: {}", self.export_format.label()));
+            }
+            KeyEvent {
+                code: KeyCode::Char('e'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.export_current_matches(),
             KeyEvent {
                 code: KeyCode::Left,
                 modifiers: KeyModifiers::ALT,
@@ -354,6 +372,7 @@ impl App {
         self.last_regex_edit = Instant::now();
         self.regex_dirty = true;
         self.history_cursor = None;
+        self.export_status = None;
     }
 
     fn move_cursor_left(&mut self) {
@@ -413,6 +432,26 @@ impl App {
                 .ensure_line_index(self.scroll_line + VIEW_MARGIN_LINES)?;
         }
         Ok(())
+    }
+
+    fn export_current_matches(&mut self) {
+        let Some(regex) = self.compiled.as_ref() else {
+            self.export_status = Some("export failed: regex is empty or invalid".to_string());
+            return;
+        };
+
+        match export::export_matches(&self.file.path, regex, self.export_format) {
+            Ok(result) => {
+                self.export_status = Some(format!(
+                    "exported {} matches to {}",
+                    result.matches,
+                    result.path.display()
+                ));
+            }
+            Err(err) => {
+                self.export_status = Some(format!("export failed: {err}"));
+            }
+        }
     }
 
     fn push_history_current(&mut self) {

@@ -225,7 +225,9 @@ impl Parser {
             'r' => r"\r matches a carriage return character".to_string(),
             't' => r"\t matches a tab character".to_string(),
             other => {
-                format!("\\{other} matches the character \"{other}\" literally or uses a regex escape")
+                format!(
+                    "\\{other} matches the character \"{other}\" literally or uses a regex escape"
+                )
             }
         }
     }

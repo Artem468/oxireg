@@ -85,6 +85,16 @@ The text pane and inspector pane can be resized from the keyboard.
 
 Mouse wheel scrolling works in the text view.
 
+### Export Matches
+
+Matches can be exported from the current regex into local files:
+
+- `json`
+- `csv`
+- `txt`
+
+The export scans the current input file line by line and writes one record per match. Named and numbered captures are included in structured formats.
+
 ### Regex Flags
 
 Regex flags can be toggled without editing the pattern:
@@ -139,6 +149,16 @@ Get-Content .\file.log | target\release\oxireg.exe
 cat file.log | oxireg
 ```
 
+Headless export without opening the TUI:
+
+```powershell
+target\release\oxireg.exe --regex "status=(?P<code>\d+)" --export json .\file.log
+```
+
+```bash
+cat file.log | oxireg --regex 'status=(?P<code>\d+)' --flags i --export csv
+```
+
 ## Controls
 
 | Key | Action |
@@ -155,6 +175,8 @@ cat file.log | oxireg
 | Mouse wheel | Scroll |
 | `Ctrl-Home` / `Ctrl-End` | Jump to file start/end |
 | `Alt-Left` / `Alt-Right` | Resize text/inspector panes |
+| `Alt-E` | Cycle export format |
+| `Ctrl-E` | Export matches using the current format |
 | `F2` / click Frequency | Collapse/expand frequency panel |
 | `F3` / click Status | Collapse/expand status panel |
 | `F4` / `Alt-g` | Toggle matching-lines-only mode |
