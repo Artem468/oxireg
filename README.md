@@ -9,8 +9,10 @@ It is built for the cases where browser tools stop being practical: huge logs, p
 Most regex tools are optimized for small snippets. `oxireg` is optimized for real files.
 
 - Open large logs without loading the whole file into memory.
+- Read from a file path or from stdin.
 - Edit a regex interactively and see matches immediately.
 - Scan the full file in the background while the UI stays responsive.
+- Match large files with a chunked parallel scanner.
 - Jump between matches without waiting for a full rescan.
 - Collapse noise and turn a huge log into an interactive grep view.
 - Analyze named capture groups as live frequency distributions.
@@ -29,7 +31,7 @@ Capture groups are highlighted with distinct colors. When capture groups exist, 
 
 ### Match Map
 
-A background scanner walks the file and builds a match index:
+A background scanner walks the file and builds a match index. It reads line chunks and runs regex matching across worker threads while preserving file order in the UI:
 
 - byte offsets
 - line numbers
@@ -70,6 +72,18 @@ For a regex like:
 - `302`
 
 The frequency panel renders a donut-style chart using `ratatui` canvas plus a legend with counts.
+
+### Explain Mode
+
+The Explain panel gives a compact human-readable breakdown of the current regex: anchors, groups, character classes, escapes, quantifiers, literals, and common constructs.
+
+### Resizable Panels
+
+The text pane and inspector pane can be resized from the keyboard.
+
+### Mouse Scroll
+
+Mouse wheel scrolling works in the text view.
 
 ### Regex Flags
 
@@ -115,6 +129,16 @@ Or after building:
 target\release\oxireg.exe path\to\file.log
 ```
 
+Read from stdin:
+
+```powershell
+Get-Content .\file.log | target\release\oxireg.exe
+```
+
+```bash
+cat file.log | oxireg
+```
+
 ## Controls
 
 | Key | Action |
@@ -128,7 +152,9 @@ target\release\oxireg.exe path\to\file.log
 | `Ctrl-Up` / `Ctrl-Down` | Navigate regex history |
 | `Up` / `Down` | Scroll file |
 | `PageUp` / `PageDown` | Scroll faster |
+| Mouse wheel | Scroll |
 | `Ctrl-Home` / `Ctrl-End` | Jump to file start/end |
+| `Alt-Left` / `Alt-Right` | Resize text/inspector panes |
 | `F2` / click Frequency | Collapse/expand frequency panel |
 | `F3` / click Status | Collapse/expand status panel |
 | `F4` / `Alt-g` | Toggle matching-lines-only mode |
@@ -145,6 +171,8 @@ target\release\oxireg.exe path\to\file.log
 
 The UI path reads only what it needs for the current viewport. The full-file scan runs separately and reports batches back to the UI thread. Changing the regex cancels the previous scan and starts a new one.
 
+The scanner uses a producer/worker model: the reader splits the file into line chunks, worker threads run regex matching over those chunks, and the UI applies completed chunks in original file order.
+
 This keeps the interface responsive while still allowing full-file features like match maps, jump navigation, and group frequency analysis.
 
 ## Current Limitations
@@ -153,6 +181,7 @@ This keeps the interface responsive while still allowing full-file features like
 - Multi-line regex matching is compiled, but the file scanner currently processes line by line.
 - Frequency analysis is based on named capture groups from indexed matches.
 - Paste support depends on terminal bracketed paste behavior.
+- Stdin input is spooled to a temporary file before the TUI starts, so viewport seeking and background indexing still work.
 
 ## License
 

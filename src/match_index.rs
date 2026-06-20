@@ -4,7 +4,7 @@ use std::{
     io::{BufRead, BufReader},
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
@@ -14,6 +14,7 @@ use std::{
 use regex::Regex;
 
 const BATCH_SIZE: usize = 1024;
+const CHUNK_LINES: usize = 4096;
 
 #[derive(Clone)]
 pub struct MatchHit {
@@ -30,6 +31,7 @@ pub struct FrequencyDelta {
 pub enum ScanMessage {
     Batch {
         generation: u64,
+        chunk_index: usize,
         hits: Vec<MatchHit>,
         frequencies: Vec<FrequencyDelta>,
         bytes_scanned: u64,
@@ -56,6 +58,8 @@ pub struct MatchIndex {
     pub error: Option<String>,
     pub frequencies: BTreeMap<String, BTreeMap<String, u64>>,
     generation: u64,
+    next_chunk: usize,
+    pending: BTreeMap<usize, PendingBatch>,
     receiver: Receiver<ScanMessage>,
     cancel: Option<Arc<AtomicBool>>,
     worker: Option<JoinHandle<()>>,
@@ -74,6 +78,8 @@ impl MatchIndex {
             error: None,
             frequencies: BTreeMap::new(),
             generation: 0,
+            next_chunk: 0,
+            pending: BTreeMap::new(),
             receiver,
             cancel: None,
             worker: None,
@@ -92,6 +98,8 @@ impl MatchIndex {
         self.complete = false;
         self.error = None;
         self.frequencies.clear();
+        self.next_chunk = 0;
+        self.pending.clear();
 
         let generation = self.generation;
         let cancel = Arc::new(AtomicBool::new(false));
@@ -115,6 +123,8 @@ impl MatchIndex {
         self.complete = true;
         self.error = None;
         self.frequencies.clear();
+        self.next_chunk = 0;
+        self.pending.clear();
     }
 
     pub fn drain(&mut self) {
@@ -122,16 +132,22 @@ impl MatchIndex {
             match message {
                 ScanMessage::Batch {
                     generation,
+                    chunk_index,
                     mut hits,
                     frequencies,
                     bytes_scanned,
                     lines_scanned,
                 } if generation == self.generation => {
-                    self.apply_hits(&hits);
-                    self.hits.append(&mut hits);
-                    self.apply_frequencies(frequencies);
-                    self.bytes_scanned = bytes_scanned;
-                    self.lines_scanned = lines_scanned;
+                    self.pending.insert(
+                        chunk_index,
+                        PendingBatch {
+                            hits: std::mem::take(&mut hits),
+                            frequencies,
+                            bytes_scanned,
+                            lines_scanned,
+                        },
+                    );
+                    self.apply_pending();
                 }
                 ScanMessage::Done {
                     generation,
@@ -244,6 +260,24 @@ impl MatchIndex {
             }
         }
     }
+
+    fn apply_pending(&mut self) {
+        while let Some(mut batch) = self.pending.remove(&self.next_chunk) {
+            self.apply_hits(&batch.hits);
+            self.hits.append(&mut batch.hits);
+            self.apply_frequencies(batch.frequencies);
+            self.bytes_scanned = self.bytes_scanned.max(batch.bytes_scanned);
+            self.lines_scanned = self.lines_scanned.max(batch.lines_scanned);
+            self.next_chunk += 1;
+        }
+    }
+}
+
+struct PendingBatch {
+    hits: Vec<MatchHit>,
+    frequencies: Vec<FrequencyDelta>,
+    bytes_scanned: u64,
+    lines_scanned: usize,
 }
 
 impl Drop for MatchIndex {
@@ -270,17 +304,42 @@ fn scan_file(
         }
     };
 
-    let mut reader = BufReader::new(file);
-    let mut line = Vec::new();
-    let mut line_number = 0;
-    let mut byte_offset = 0_u64;
-    let mut batch = Vec::with_capacity(BATCH_SIZE);
     let named_groups: Vec<(usize, String)> = regex
         .capture_names()
         .enumerate()
         .filter_map(|(idx, name)| name.map(|name| (idx, name.to_string())))
         .collect();
-    let mut frequency_batch: BTreeMap<(String, String), u64> = BTreeMap::new();
+    let worker_count = thread::available_parallelism()
+        .map(|count| count.get().saturating_sub(1).max(1))
+        .unwrap_or(1);
+    let (work_sender, work_receiver) = mpsc::channel();
+    let work_receiver = Arc::new(Mutex::new(work_receiver));
+    let mut workers = Vec::with_capacity(worker_count);
+
+    for _ in 0..worker_count {
+        let worker_receiver = Arc::clone(&work_receiver);
+        let worker_sender = sender.clone();
+        let worker_regex = regex.clone();
+        let worker_groups = named_groups.clone();
+        let worker_cancel = Arc::clone(&cancel);
+        workers.push(thread::spawn(move || {
+            worker_loop(
+                worker_receiver,
+                worker_sender,
+                worker_regex,
+                worker_groups,
+                generation,
+                worker_cancel,
+            );
+        }));
+    }
+
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut line_number = 0;
+    let mut byte_offset = 0_u64;
+    let mut chunk_index = 0;
+    let mut chunk = Vec::with_capacity(CHUNK_LINES);
 
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -303,67 +362,40 @@ fn scan_file(
         }
 
         line_number += 1;
-        let text = String::from_utf8_lossy(&line);
-        for captures in regex.captures_iter(&text) {
-            let Some(matched) = captures.get(0) else {
-                continue;
-            };
-            if matched.start() == matched.end() {
-                continue;
-            }
-            batch.push(MatchHit {
-                line: line_number,
-                byte_offset: byte_offset + matched.start() as u64,
-            });
-            for (idx, name) in &named_groups {
-                if let Some(value) = captures.get(*idx) {
-                    *frequency_batch
-                        .entry((name.clone(), value.as_str().to_string()))
-                        .or_default() += 1;
-                }
-            }
-            if batch.len() >= BATCH_SIZE {
-                send_batch(
-                    &sender,
-                    generation,
-                    &mut batch,
-                    &mut frequency_batch,
-                    byte_offset + read as u64,
-                    line_number,
-                );
-            }
-        }
-
+        chunk.push(ScanLine {
+            line: line_number,
+            byte_offset,
+            text: String::from_utf8_lossy(&line).into_owned(),
+        });
         byte_offset += read as u64;
-        if line_number % 4096 == 0 && batch.is_empty() {
-            let _ = sender.send(ScanMessage::Batch {
-                generation,
-                hits: Vec::new(),
-                frequencies: take_frequencies(&mut frequency_batch),
+
+        if chunk.len() >= CHUNK_LINES {
+            let work = WorkChunk {
+                index: chunk_index,
+                lines: std::mem::take(&mut chunk),
                 bytes_scanned: byte_offset,
                 lines_scanned: line_number,
-            });
+            };
+            if work_sender.send(work).is_err() {
+                return;
+            }
+            chunk_index += 1;
         }
     }
 
-    if !batch.is_empty() {
-        send_batch(
-            &sender,
-            generation,
-            &mut batch,
-            &mut frequency_batch,
-            byte_offset,
-            line_number,
-        );
-    } else if !frequency_batch.is_empty() {
-        let _ = sender.send(ScanMessage::Batch {
-            generation,
-            hits: Vec::new(),
-            frequencies: take_frequencies(&mut frequency_batch),
+    if !chunk.is_empty() {
+        let _ = work_sender.send(WorkChunk {
+            index: chunk_index,
+            lines: chunk,
             bytes_scanned: byte_offset,
             lines_scanned: line_number,
         });
     }
+    drop(work_sender);
+    for worker in workers {
+        let _ = worker.join();
+    }
+
     let _ = sender.send(ScanMessage::Done {
         generation,
         bytes_scanned: byte_offset,
@@ -371,21 +403,83 @@ fn scan_file(
     });
 }
 
-fn send_batch(
-    sender: &Sender<ScanMessage>,
-    generation: u64,
-    batch: &mut Vec<MatchHit>,
-    frequencies: &mut BTreeMap<(String, String), u64>,
+struct ScanLine {
+    line: usize,
+    byte_offset: u64,
+    text: String,
+}
+
+struct WorkChunk {
+    index: usize,
+    lines: Vec<ScanLine>,
     bytes_scanned: u64,
     lines_scanned: usize,
+}
+
+fn worker_loop(
+    receiver: Arc<Mutex<Receiver<WorkChunk>>>,
+    sender: Sender<ScanMessage>,
+    regex: Regex,
+    named_groups: Vec<(usize, String)>,
+    generation: u64,
+    cancel: Arc<AtomicBool>,
 ) {
-    let hits = std::mem::take(batch);
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let work = {
+            let Ok(receiver) = receiver.lock() else {
+                return;
+            };
+            receiver.recv()
+        };
+        let Ok(work) = work else {
+            return;
+        };
+        process_chunk(&sender, generation, &regex, &named_groups, work);
+    }
+}
+
+fn process_chunk(
+    sender: &Sender<ScanMessage>,
+    generation: u64,
+    regex: &Regex,
+    named_groups: &[(usize, String)],
+    work: WorkChunk,
+) {
+    let mut hits = Vec::with_capacity(BATCH_SIZE);
+    let mut frequencies: BTreeMap<(String, String), u64> = BTreeMap::new();
+
+    for line in work.lines {
+        for captures in regex.captures_iter(&line.text) {
+            let Some(matched) = captures.get(0) else {
+                continue;
+            };
+            if matched.start() == matched.end() {
+                continue;
+            }
+            hits.push(MatchHit {
+                line: line.line,
+                byte_offset: line.byte_offset + matched.start() as u64,
+            });
+            for (idx, name) in named_groups {
+                if let Some(value) = captures.get(*idx) {
+                    *frequencies
+                        .entry((name.clone(), value.as_str().to_string()))
+                        .or_default() += 1;
+                }
+            }
+        }
+    }
+
     let _ = sender.send(ScanMessage::Batch {
         generation,
+        chunk_index: work.index,
         hits,
-        frequencies: take_frequencies(frequencies),
-        bytes_scanned,
-        lines_scanned,
+        frequencies: take_frequencies(&mut frequencies),
+        bytes_scanned: work.bytes_scanned,
+        lines_scanned: work.lines_scanned,
     });
 }
 

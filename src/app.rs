@@ -10,6 +10,7 @@ use ratatui::layout::Rect;
 use regex::Regex;
 
 use crate::{
+    explain,
     file_view::{FileView, VIEW_MARGIN_LINES},
     match_index::MatchIndex,
     regex_debug::{RegexFlags, capture_descriptions, compile_regex},
@@ -22,6 +23,7 @@ pub struct App {
     pub regex_input: String,
     pub compiled: Option<Regex>,
     pub regex_error: Option<String>,
+    pub explanation: Vec<String>,
     pub captures: Vec<String>,
     pub match_index: MatchIndex,
     pub flags: RegexFlags,
@@ -30,6 +32,7 @@ pub struct App {
     pub collapse_matches: bool,
     pub frequency_collapsed: bool,
     pub status_collapsed: bool,
+    pub right_panel_percent: u16,
     pub frequency_area: Rect,
     pub status_area: Rect,
     pub should_quit: bool,
@@ -46,6 +49,7 @@ impl App {
             regex_input: String::new(),
             compiled: None,
             regex_error: None,
+            explanation: explain::explain(""),
             captures: Vec::new(),
             match_index: MatchIndex::new(),
             flags: RegexFlags::default(),
@@ -54,6 +58,7 @@ impl App {
             collapse_matches: false,
             frequency_collapsed: false,
             status_collapsed: false,
+            right_panel_percent: 32,
             frequency_area: Rect::default(),
             status_area: Rect::default(),
             should_quit: false,
@@ -156,6 +161,16 @@ impl App {
                 modifiers: KeyModifiers::ALT,
                 ..
             } => self.jump_to_prev_match()?,
+            KeyEvent {
+                code: KeyCode::Left,
+                modifiers: KeyModifiers::ALT,
+                ..
+            } => self.right_panel_percent = self.right_panel_percent.saturating_sub(2).max(20),
+            KeyEvent {
+                code: KeyCode::Right,
+                modifiers: KeyModifiers::ALT,
+                ..
+            } => self.right_panel_percent = (self.right_panel_percent + 2).min(60),
             KeyEvent {
                 code: KeyCode::Char(ch),
                 modifiers: KeyModifiers::NONE | KeyModifiers::SHIFT,
@@ -262,16 +277,21 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
-        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
-            return;
-        }
-
-        let x = mouse.column;
-        let y = mouse.row;
-        if contains(self.frequency_area, x, y) {
-            self.frequency_collapsed = !self.frequency_collapsed;
-        } else if contains(self.status_area, x, y) {
-            self.status_collapsed = !self.status_collapsed;
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let x = mouse.column;
+                let y = mouse.row;
+                if contains(self.frequency_area, x, y) {
+                    self.frequency_collapsed = !self.frequency_collapsed;
+                } else if contains(self.status_area, x, y) {
+                    self.status_collapsed = !self.status_collapsed;
+                }
+            }
+            MouseEventKind::ScrollUp => self.scroll_up(3),
+            MouseEventKind::ScrollDown => {
+                let _ = self.scroll_down(3);
+            }
+            _ => {}
         }
     }
 
@@ -299,6 +319,7 @@ impl App {
         if self.regex_input.is_empty() {
             self.compiled = None;
             self.regex_error = None;
+            self.explanation = explain::explain("");
             self.captures.clear();
             self.match_index.clear();
             return;
@@ -315,9 +336,13 @@ impl App {
             Err(err) => {
                 self.compiled = None;
                 self.regex_error = Some(err.to_string());
+                self.explanation = explain::explain(&self.regex_input);
                 self.captures.clear();
                 self.match_index.clear();
             }
+        }
+        if self.regex_error.is_none() {
+            self.explanation = explain::explain(&self.regex_input);
         }
     }
 
@@ -368,6 +393,22 @@ impl App {
 
         if let Some(line) = self.match_index.prev_line_before(self.scroll_line + 1) {
             self.scroll_line = line.saturating_sub(1);
+            self.file
+                .ensure_line_index(self.scroll_line + VIEW_MARGIN_LINES)?;
+        }
+        Ok(())
+    }
+
+    fn scroll_up(&mut self, amount: usize) {
+        self.scroll_line = self.scroll_line.saturating_sub(amount);
+    }
+
+    fn scroll_down(&mut self, amount: usize) -> io::Result<()> {
+        if self.collapse_matches {
+            self.scroll_line = (self.scroll_line + amount)
+                .min(self.match_index.matching_line_count().saturating_sub(1));
+        } else {
+            self.scroll_line += amount;
             self.file
                 .ensure_line_index(self.scroll_line + VIEW_MARGIN_LINES)?;
         }

@@ -28,7 +28,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 
     let body = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+        .constraints([
+            Constraint::Percentage(100 - app.right_panel_percent),
+            Constraint::Percentage(app.right_panel_percent),
+        ])
         .split(root[1]);
 
     let text_chunks = Layout::default()
@@ -177,23 +180,27 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &mut App, lines: &[TextL
     let constraints = match (app.frequency_collapsed, app.status_collapsed) {
         (true, true) => vec![
             Constraint::Length(3),
-            Constraint::Min(3),
+            Constraint::Percentage(40),
+            Constraint::Percentage(40),
             Constraint::Length(3),
         ],
         (true, false) => vec![
             Constraint::Length(3),
-            Constraint::Percentage(54),
-            Constraint::Percentage(46),
+            Constraint::Percentage(32),
+            Constraint::Percentage(28),
+            Constraint::Percentage(40),
         ],
         (false, true) => vec![
-            Constraint::Percentage(62),
-            Constraint::Percentage(38),
+            Constraint::Percentage(40),
+            Constraint::Percentage(34),
+            Constraint::Percentage(26),
             Constraint::Length(3),
         ],
         (false, false) => vec![
-            Constraint::Percentage(46),
+            Constraint::Percentage(34),
+            Constraint::Percentage(24),
             Constraint::Percentage(28),
-            Constraint::Percentage(26),
+            Constraint::Percentage(14),
         ],
     };
 
@@ -202,11 +209,12 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &mut App, lines: &[TextL
         .constraints(constraints)
         .split(area);
     app.frequency_area = chunks[0];
-    app.status_area = chunks[2];
+    app.status_area = chunks[3];
 
     draw_frequency(frame, chunks[0], app);
-    draw_groups(frame, chunks[1], app, lines);
-    draw_regex_status(frame, chunks[2], app);
+    draw_explain(frame, chunks[1], app);
+    draw_groups(frame, chunks[2], app, lines);
+    draw_regex_status(frame, chunks[3], app);
 }
 
 fn draw_frequency(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -367,6 +375,17 @@ fn draw_groups(frame: &mut Frame<'_>, area: Rect, app: &App, lines: &[TextLine])
     );
 }
 
+fn draw_explain(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let items = app
+        .explanation
+        .iter()
+        .map(|line| ListItem::new(line.as_str()));
+    frame.render_widget(
+        List::new(items).block(Block::default().borders(Borders::ALL).title("Explain")),
+        area,
+    );
+}
+
 fn draw_regex_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if app.status_collapsed {
         frame.render_widget(
@@ -438,7 +457,7 @@ fn group_lines(app: &App, lines: &[TextLine]) -> Vec<String> {
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let text = format!(
-        "Esc/Ctrl-C quit | Enter save regex | Ctrl-Up/Down history | F2 Freq | F4/Alt-g grep:{} | F8 next | F9 prev | F3 Status | F5/F6/F7 flags {} | {} | loaded line index: {}",
+        "Esc/Ctrl-C quit | Enter history | Ctrl-Up/Down history | Alt-Left/Right resize | F4 grep:{} | F8/F9 match | flags {} | {} | loaded line index: {}",
         if app.collapse_matches { "on" } else { "off" },
         app.flags.label(),
         app.match_index.progress_label(),
