@@ -1,10 +1,6 @@
-<table>
-	<tr>
-		<td><img src="assets/icon.png" alt="Harpoon icon" width="96" height="96" style="width:96px;height:96px;border-radius:50%;object-fit:cover;"/></td>
-		<td valign="middle"><h1>Oxireg</h1></td>
-	</tr>
-</table>
-
+<p align="center">
+  <img src="assets/icon.png" alt="VeloGate logo" width="220">
+</p>
 It is built for the cases where browser tools stop being practical: huge logs, private data, remote shells, and workflows where sending text to a website is not acceptable.
 
 ## Why
