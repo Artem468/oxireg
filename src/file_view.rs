@@ -6,11 +6,14 @@ use std::{
 
 pub const VIEW_MARGIN_LINES: usize = 120;
 const MAX_LINE_BYTES: usize = 32 * 1024;
+const LINE_CHECKPOINT_STRIDE: usize = 128;
 
 pub struct FileView {
     pub path: PathBuf,
     reader: BufReader<File>,
-    line_offsets: Vec<u64>,
+    line_checkpoints: Vec<u64>,
+    indexed_lines: usize,
+    indexed_offset: u64,
     eof: bool,
 }
 
@@ -20,40 +23,71 @@ impl FileView {
         Ok(Self {
             path,
             reader: BufReader::new(file),
-            line_offsets: vec![0],
+            line_checkpoints: vec![0],
+            indexed_lines: 1,
+            indexed_offset: 0,
             eof: false,
         })
     }
 
     pub fn known_lines(&self) -> usize {
-        self.line_offsets.len()
+        self.indexed_lines
     }
 
-    pub fn byte_offset_for_line(&self, line: usize) -> Option<u64> {
-        self.line_offsets.get(line).copied()
+    pub fn byte_offset_for_line(&mut self, line: usize) -> io::Result<Option<u64>> {
+        self.offset_for_line(line)
     }
 
     pub fn ensure_line_index(&mut self, line: usize) -> io::Result<()> {
-        if self.eof || line < self.line_offsets.len() {
+        if self.eof || line < self.indexed_lines {
             return Ok(());
         }
 
-        let start = *self.line_offsets.last().unwrap_or(&0);
-        self.reader.seek(SeekFrom::Start(start))?;
-        let mut offset = start;
+        self.reader.seek(SeekFrom::Start(self.indexed_offset))?;
         let mut buffer = Vec::new();
 
-        while self.line_offsets.len() <= line {
+        while self.indexed_lines <= line {
             buffer.clear();
             let read = self.reader.read_until(b'\n', &mut buffer)?;
             if read == 0 {
                 self.eof = true;
                 break;
             }
-            offset += read as u64;
-            self.line_offsets.push(offset);
+            self.indexed_offset += read as u64;
+            if self.indexed_lines.is_multiple_of(LINE_CHECKPOINT_STRIDE) {
+                self.line_checkpoints.push(self.indexed_offset);
+            }
+            self.indexed_lines += 1;
         }
         Ok(())
+    }
+
+    fn offset_for_line(&mut self, line: usize) -> io::Result<Option<u64>> {
+        self.ensure_line_index(line)?;
+        if line >= self.indexed_lines {
+            return Ok(None);
+        }
+
+        let checkpoint_idx = line / LINE_CHECKPOINT_STRIDE;
+        let checkpoint_line = checkpoint_idx * LINE_CHECKPOINT_STRIDE;
+        let Some(mut offset) = self.line_checkpoints.get(checkpoint_idx).copied() else {
+            return Ok(None);
+        };
+        if checkpoint_line == line {
+            return Ok(Some(offset));
+        }
+
+        self.reader.seek(SeekFrom::Start(offset))?;
+        let mut buffer = Vec::new();
+        for _ in checkpoint_line..line {
+            buffer.clear();
+            let read = self.reader.read_until(b'\n', &mut buffer)?;
+            if read == 0 {
+                return Ok(None);
+            }
+            offset += read as u64;
+        }
+        Ok(Some(offset))
     }
 
     pub fn read_window(
@@ -65,10 +99,8 @@ impl FileView {
         self.ensure_line_index(target)?;
 
         let start_offset = self
-            .line_offsets
-            .get(start_line)
-            .copied()
-            .unwrap_or_else(|| *self.line_offsets.last().unwrap_or(&0));
+            .offset_for_line(start_line)?
+            .unwrap_or(self.indexed_offset);
         self.reader.seek(SeekFrom::Start(start_offset))?;
 
         let mut lines = Vec::with_capacity(visible_lines);
@@ -105,8 +137,7 @@ impl FileView {
             }
 
             let line_idx = line_number - 1;
-            self.ensure_line_index(line_idx)?;
-            let Some(offset) = self.line_offsets.get(line_idx).copied() else {
+            let Some(offset) = self.offset_for_line(line_idx)? else {
                 continue;
             };
 

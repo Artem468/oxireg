@@ -6,21 +6,21 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, Sender},
+        mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
 };
 
-use regex::Regex;
+use regex::{CaptureNames, Regex};
 
 const BATCH_SIZE: usize = 1024;
 const CHUNK_LINES: usize = 4096;
+const MAX_QUEUED_CHUNKS_PER_WORKER: usize = 2;
+const MATCH_MAP_BUCKETS: usize = 8192;
+const MAX_FREQUENCY_VALUES_PER_GROUP: usize = 256;
 
-#[derive(Clone)]
-pub struct MatchHit {
-    pub line: usize,
-    pub byte_offset: u64,
-}
+type LineNumber = u32;
+type FrequencyBatch = BTreeMap<usize, BTreeMap<String, u64>>;
 
 pub struct FrequencyDelta {
     pub group: String,
@@ -32,7 +32,9 @@ pub enum ScanMessage {
     Batch {
         generation: u64,
         chunk_index: usize,
-        hits: Vec<MatchHit>,
+        matching_lines: Vec<LineNumber>,
+        map_buckets: Vec<u16>,
+        hit_count: u64,
         frequencies: Vec<FrequencyDelta>,
         bytes_scanned: u64,
         lines_scanned: usize,
@@ -49,14 +51,15 @@ pub enum ScanMessage {
 }
 
 pub struct MatchIndex {
-    pub hits: Vec<MatchHit>,
-    pub matching_lines: Vec<usize>,
+    matching_lines: Vec<LineNumber>,
+    pub hit_count: u64,
     pub bytes_scanned: u64,
     pub lines_scanned: usize,
     pub file_size: u64,
     pub complete: bool,
     pub error: Option<String>,
     pub frequencies: BTreeMap<String, BTreeMap<String, u64>>,
+    map_buckets: Vec<u16>,
     generation: u64,
     next_chunk: usize,
     pending: BTreeMap<usize, PendingBatch>,
@@ -69,14 +72,15 @@ impl MatchIndex {
     pub fn new() -> Self {
         let (_sender, receiver) = mpsc::channel();
         Self {
-            hits: Vec::new(),
             matching_lines: Vec::new(),
+            hit_count: 0,
             bytes_scanned: 0,
             lines_scanned: 0,
             file_size: 0,
             complete: true,
             error: None,
             frequencies: BTreeMap::new(),
+            map_buckets: Vec::new(),
             generation: 0,
             next_chunk: 0,
             pending: BTreeMap::new(),
@@ -90,14 +94,15 @@ impl MatchIndex {
         self.cancel_current();
 
         self.generation = self.generation.wrapping_add(1);
-        self.hits.clear();
         self.matching_lines.clear();
+        self.hit_count = 0;
         self.bytes_scanned = 0;
         self.lines_scanned = 0;
         self.file_size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
         self.complete = false;
         self.error = None;
         self.frequencies.clear();
+        self.map_buckets.clear();
         self.next_chunk = 0;
         self.pending.clear();
 
@@ -115,14 +120,15 @@ impl MatchIndex {
     pub fn clear(&mut self) {
         self.cancel_current();
         self.generation = self.generation.wrapping_add(1);
-        self.hits.clear();
         self.matching_lines.clear();
+        self.hit_count = 0;
         self.bytes_scanned = 0;
         self.lines_scanned = 0;
         self.file_size = 0;
         self.complete = true;
         self.error = None;
         self.frequencies.clear();
+        self.map_buckets.clear();
         self.next_chunk = 0;
         self.pending.clear();
     }
@@ -133,7 +139,9 @@ impl MatchIndex {
                 ScanMessage::Batch {
                     generation,
                     chunk_index,
-                    mut hits,
+                    mut matching_lines,
+                    mut map_buckets,
+                    hit_count,
                     frequencies,
                     bytes_scanned,
                     lines_scanned,
@@ -141,7 +149,9 @@ impl MatchIndex {
                     self.pending.insert(
                         chunk_index,
                         PendingBatch {
-                            hits: std::mem::take(&mut hits),
+                            matching_lines: std::mem::take(&mut matching_lines),
+                            map_buckets: std::mem::take(&mut map_buckets),
+                            hit_count,
                             frequencies,
                             bytes_scanned,
                             lines_scanned,
@@ -171,20 +181,23 @@ impl MatchIndex {
     }
 
     pub fn next_line_after(&self, current_line: usize) -> Option<usize> {
-        self.hits
-            .partition_point(|hit| hit.line <= current_line)
+        self.matching_lines
+            .partition_point(|line| line_to_usize(*line) <= current_line)
             .checked_sub(0)
-            .and_then(|idx| self.hits.get(idx))
-            .map(|hit| hit.line)
-            .or_else(|| self.hits.first().map(|hit| hit.line))
+            .and_then(|idx| self.matching_lines.get(idx))
+            .copied()
+            .map(line_to_usize)
+            .or_else(|| self.matching_lines.first().copied().map(line_to_usize))
     }
 
     pub fn prev_line_before(&self, current_line: usize) -> Option<usize> {
-        let idx = self.hits.partition_point(|hit| hit.line < current_line);
+        let idx = self
+            .matching_lines
+            .partition_point(|line| line_to_usize(*line) < current_line);
         if idx > 0 {
-            self.hits.get(idx - 1).map(|hit| hit.line)
+            self.matching_lines.get(idx - 1).copied().map(line_to_usize)
         } else {
-            self.hits.last().map(|hit| hit.line)
+            self.matching_lines.last().copied().map(line_to_usize)
         }
     }
 
@@ -194,11 +207,26 @@ impl MatchIndex {
             .skip(start)
             .take(len)
             .copied()
+            .map(line_to_usize)
             .collect()
     }
 
     pub fn matching_line_count(&self) -> usize {
         self.matching_lines.len()
+    }
+
+    pub fn match_map_rows(&self, rows: usize) -> Vec<bool> {
+        let mut marks = vec![false; rows];
+        if rows == 0 {
+            return marks;
+        }
+
+        for &bucket in &self.map_buckets {
+            let row = ((bucket as usize).saturating_mul(rows) / MATCH_MAP_BUCKETS)
+                .min(rows.saturating_sub(1));
+            marks[row] = true;
+        }
+        marks
     }
 
     pub fn top_frequency_bars(&self, limit: usize) -> Option<(String, Vec<(String, u64)>)> {
@@ -227,9 +255,7 @@ impl MatchIndex {
             Some(error) => format!("index error: {error}"),
             None => format!(
                 "{state} {:.0}% | hits {} | lines {}",
-                percent,
-                self.hits.len(),
-                self.lines_scanned
+                percent, self.hit_count, self.lines_scanned
             ),
         }
     }
@@ -238,33 +264,44 @@ impl MatchIndex {
         if let Some(cancel) = &self.cancel {
             cancel.store(true, Ordering::Relaxed);
         }
-        let _ = self.worker.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
         self.cancel = None;
     }
 
     fn apply_frequencies(&mut self, frequencies: Vec<FrequencyDelta>) {
         for delta in frequencies {
-            *self
-                .frequencies
-                .entry(delta.group)
-                .or_default()
-                .entry(delta.value)
-                .or_default() += delta.count;
+            let values = self.frequencies.entry(delta.group).or_default();
+            if let Some(count) = values.get_mut(&delta.value) {
+                *count += delta.count;
+            } else if values.len() < MAX_FREQUENCY_VALUES_PER_GROUP {
+                values.insert(delta.value, delta.count);
+            }
         }
     }
 
-    fn apply_hits(&mut self, hits: &[MatchHit]) {
-        for hit in hits {
-            if self.matching_lines.last().copied() != Some(hit.line) {
-                self.matching_lines.push(hit.line);
+    fn apply_matching_lines(&mut self, lines: &[LineNumber]) {
+        for &line in lines {
+            if self.matching_lines.last().copied() != Some(line) {
+                self.matching_lines.push(line);
+            }
+        }
+    }
+
+    fn apply_map_buckets(&mut self, buckets: &[u16]) {
+        for &bucket in buckets {
+            if self.map_buckets.last().copied() != Some(bucket) {
+                self.map_buckets.push(bucket);
             }
         }
     }
 
     fn apply_pending(&mut self) {
-        while let Some(mut batch) = self.pending.remove(&self.next_chunk) {
-            self.apply_hits(&batch.hits);
-            self.hits.append(&mut batch.hits);
+        while let Some(batch) = self.pending.remove(&self.next_chunk) {
+            self.apply_matching_lines(&batch.matching_lines);
+            self.apply_map_buckets(&batch.map_buckets);
+            self.hit_count += batch.hit_count;
             self.apply_frequencies(batch.frequencies);
             self.bytes_scanned = self.bytes_scanned.max(batch.bytes_scanned);
             self.lines_scanned = self.lines_scanned.max(batch.lines_scanned);
@@ -274,7 +311,9 @@ impl MatchIndex {
 }
 
 struct PendingBatch {
-    hits: Vec<MatchHit>,
+    matching_lines: Vec<LineNumber>,
+    map_buckets: Vec<u16>,
+    hit_count: u64,
     frequencies: Vec<FrequencyDelta>,
     bytes_scanned: u64,
     lines_scanned: usize,
@@ -304,15 +343,16 @@ fn scan_file(
         }
     };
 
-    let named_groups: Vec<(usize, String)> = regex
-        .capture_names()
-        .enumerate()
-        .filter_map(|(idx, name)| name.map(|name| (idx, name.to_string())))
-        .collect();
+    let file_size = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let named_groups = named_capture_names(regex.capture_names());
     let worker_count = thread::available_parallelism()
         .map(|count| count.get().saturating_sub(1).max(1))
         .unwrap_or(1);
-    let (work_sender, work_receiver) = mpsc::channel();
+    let (work_sender, work_receiver) = mpsc::sync_channel(
+        worker_count
+            .saturating_mul(MAX_QUEUED_CHUNKS_PER_WORKER)
+            .max(1),
+    );
     let work_receiver = Arc::new(Mutex::new(work_receiver));
     let mut workers = Vec::with_capacity(worker_count);
 
@@ -328,6 +368,7 @@ fn scan_file(
                 worker_sender,
                 worker_regex,
                 worker_groups,
+                file_size,
                 generation,
                 worker_cancel,
             );
@@ -365,7 +406,7 @@ fn scan_file(
         chunk.push(ScanLine {
             line: line_number,
             byte_offset,
-            text: String::from_utf8_lossy(&line).into_owned(),
+            text: std::mem::take(&mut line),
         });
         byte_offset += read as u64;
 
@@ -376,20 +417,26 @@ fn scan_file(
                 bytes_scanned: byte_offset,
                 lines_scanned: line_number,
             };
-            if work_sender.send(work).is_err() {
+            if !send_work(&work_sender, work, &cancel) {
                 return;
             }
             chunk_index += 1;
         }
     }
 
-    if !chunk.is_empty() {
-        let _ = work_sender.send(WorkChunk {
-            index: chunk_index,
-            lines: chunk,
-            bytes_scanned: byte_offset,
-            lines_scanned: line_number,
-        });
+    if !chunk.is_empty()
+        && !send_work(
+            &work_sender,
+            WorkChunk {
+                index: chunk_index,
+                lines: chunk,
+                bytes_scanned: byte_offset,
+                lines_scanned: line_number,
+            },
+            &cancel,
+        )
+    {
+        return;
     }
     drop(work_sender);
     for worker in workers {
@@ -406,7 +453,7 @@ fn scan_file(
 struct ScanLine {
     line: usize,
     byte_offset: u64,
-    text: String,
+    text: Vec<u8>,
 }
 
 struct WorkChunk {
@@ -416,11 +463,29 @@ struct WorkChunk {
     lines_scanned: usize,
 }
 
+fn send_work(sender: &SyncSender<WorkChunk>, mut work: WorkChunk, cancel: &AtomicBool) -> bool {
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+
+        match sender.try_send(work) {
+            Ok(()) => return true,
+            Err(TrySendError::Full(returned_work)) => {
+                work = returned_work;
+                thread::yield_now();
+            }
+            Err(TrySendError::Disconnected(_)) => return false,
+        }
+    }
+}
+
 fn worker_loop(
     receiver: Arc<Mutex<Receiver<WorkChunk>>>,
     sender: Sender<ScanMessage>,
     regex: Regex,
     named_groups: Vec<(usize, String)>,
+    file_size: u64,
     generation: u64,
     cancel: Arc<AtomicBool>,
 ) {
@@ -437,7 +502,7 @@ fn worker_loop(
         let Ok(work) = work else {
             return;
         };
-        process_chunk(&sender, generation, &regex, &named_groups, work);
+        process_chunk(&sender, generation, &regex, &named_groups, file_size, work);
     }
 }
 
@@ -446,50 +511,176 @@ fn process_chunk(
     generation: u64,
     regex: &Regex,
     named_groups: &[(usize, String)],
+    file_size: u64,
     work: WorkChunk,
 ) {
-    let mut hits = Vec::with_capacity(BATCH_SIZE);
-    let mut frequencies: BTreeMap<(String, String), u64> = BTreeMap::new();
+    let mut matching_lines = Vec::with_capacity(BATCH_SIZE);
+    let mut map_buckets = Vec::new();
+    let mut bucket_seen = vec![false; MATCH_MAP_BUCKETS];
+    let mut hit_count = 0;
+    let mut frequencies: FrequencyBatch = BTreeMap::new();
 
     for line in work.lines {
-        for captures in regex.captures_iter(&line.text) {
-            let Some(matched) = captures.get(0) else {
-                continue;
-            };
-            if matched.start() == matched.end() {
-                continue;
+        let text = String::from_utf8_lossy(&line.text);
+        let mut line_matched = false;
+
+        if named_groups.is_empty() {
+            for matched in regex.find_iter(&text) {
+                if matched.start() == matched.end() {
+                    continue;
+                }
+                hit_count += 1;
+                line_matched = true;
+                mark_match_bucket(
+                    &mut bucket_seen,
+                    &mut map_buckets,
+                    line.byte_offset + matched.start() as u64,
+                    file_size,
+                );
             }
-            hits.push(MatchHit {
-                line: line.line,
-                byte_offset: line.byte_offset + matched.start() as u64,
-            });
-            for (idx, name) in named_groups {
-                if let Some(value) = captures.get(*idx) {
-                    *frequencies
-                        .entry((name.clone(), value.as_str().to_string()))
-                        .or_default() += 1;
+        } else {
+            for captures in regex.captures_iter(&text) {
+                let Some(matched) = captures.get(0) else {
+                    continue;
+                };
+                if matched.start() == matched.end() {
+                    continue;
+                }
+                hit_count += 1;
+                line_matched = true;
+                mark_match_bucket(
+                    &mut bucket_seen,
+                    &mut map_buckets,
+                    line.byte_offset + matched.start() as u64,
+                    file_size,
+                );
+                for (idx, _) in named_groups {
+                    if let Some(value) = captures.get(*idx) {
+                        increment_frequency(&mut frequencies, *idx, value.as_str());
+                    }
                 }
             }
         }
+
+        if line_matched && let Some(line_number) = to_line_number(line.line) {
+            matching_lines.push(line_number);
+        }
     }
 
+    map_buckets.sort_unstable();
     let _ = sender.send(ScanMessage::Batch {
         generation,
         chunk_index: work.index,
-        hits,
-        frequencies: take_frequencies(&mut frequencies),
+        matching_lines,
+        map_buckets,
+        hit_count,
+        frequencies: take_frequencies(&mut frequencies, named_groups),
         bytes_scanned: work.bytes_scanned,
         lines_scanned: work.lines_scanned,
     });
 }
 
-fn take_frequencies(frequencies: &mut BTreeMap<(String, String), u64>) -> Vec<FrequencyDelta> {
+fn increment_frequency(frequencies: &mut FrequencyBatch, group_idx: usize, value: &str) {
+    let values = frequencies.entry(group_idx).or_default();
+    if let Some(count) = values.get_mut(value) {
+        *count += 1;
+        return;
+    }
+
+    if values.len() >= MAX_FREQUENCY_VALUES_PER_GROUP {
+        return;
+    }
+
+    values.insert(value.to_string(), 1);
+}
+
+fn mark_match_bucket(seen: &mut [bool], buckets: &mut Vec<u16>, byte_offset: u64, file_size: u64) {
+    let bucket = match_bucket(byte_offset, file_size);
+    if !seen[bucket as usize] {
+        seen[bucket as usize] = true;
+        buckets.push(bucket);
+    }
+}
+
+fn match_bucket(byte_offset: u64, file_size: u64) -> u16 {
+    if file_size == 0 {
+        return 0;
+    }
+    ((byte_offset.saturating_mul(MATCH_MAP_BUCKETS as u64)) / file_size)
+        .min(MATCH_MAP_BUCKETS.saturating_sub(1) as u64) as u16
+}
+
+fn to_line_number(line: usize) -> Option<LineNumber> {
+    line.try_into().ok()
+}
+
+fn line_to_usize(line: LineNumber) -> usize {
+    line as usize
+}
+
+fn named_capture_names(capture_names: CaptureNames<'_>) -> Vec<(usize, String)> {
+    capture_names
+        .enumerate()
+        .filter_map(|(idx, name)| name.map(|name| (idx, name.to_string())))
+        .collect()
+}
+
+fn take_frequencies(
+    frequencies: &mut FrequencyBatch,
+    named_groups: &[(usize, String)],
+) -> Vec<FrequencyDelta> {
     std::mem::take(frequencies)
         .into_iter()
-        .map(|((group, value), count)| FrequencyDelta {
-            group,
-            value,
-            count,
+        .flat_map(|(idx, values)| {
+            let group = named_groups
+                .iter()
+                .find_map(|(group_idx, name)| (*group_idx == idx).then_some(name.clone()));
+            values.into_iter().filter_map(move |(value, count)| {
+                group.clone().map(|group| FrequencyDelta {
+                    group,
+                    value,
+                    count,
+                })
+            })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MAX_FREQUENCY_VALUES_PER_GROUP, increment_frequency, named_capture_names, take_frequencies,
+    };
+    use regex::Regex;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn keeps_frequency_group_names_without_cloning_names_per_hit() {
+        let regex = Regex::new(r"(?P<kind>\w+)").unwrap();
+        let groups = named_capture_names(regex.capture_names());
+        let mut frequencies = BTreeMap::from([(1, BTreeMap::from([("error".to_string(), 2)]))]);
+
+        assert_eq!(
+            take_frequencies(&mut frequencies, &groups)
+                .into_iter()
+                .map(|delta| (delta.group, delta.value, delta.count))
+                .collect::<Vec<_>>(),
+            vec![("kind".to_string(), "error".to_string(), 2)]
+        );
+    }
+
+    #[test]
+    fn caps_unique_frequency_values_per_group() {
+        let mut frequencies = BTreeMap::new();
+
+        for idx in 0..MAX_FREQUENCY_VALUES_PER_GROUP + 10 {
+            increment_frequency(&mut frequencies, 1, &format!("value-{idx}"));
+        }
+
+        increment_frequency(&mut frequencies, 1, "value-1");
+
+        let values = frequencies.get(&1).unwrap();
+        assert_eq!(values.len(), MAX_FREQUENCY_VALUES_PER_GROUP);
+        assert_eq!(values.get("value-1"), Some(&2));
+    }
 }

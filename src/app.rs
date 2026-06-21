@@ -382,10 +382,10 @@ impl App {
     }
 
     fn move_cursor_right(&mut self) {
-        if self.cursor < self.regex_input.len() {
-            if let Some(ch) = self.regex_input[self.cursor..].chars().next() {
-                self.cursor += ch.len_utf8();
-            }
+        if self.cursor < self.regex_input.len()
+            && let Some(ch) = self.regex_input[self.cursor..].chars().next()
+        {
+            self.cursor += ch.len_utf8();
         }
     }
 

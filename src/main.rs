@@ -12,7 +12,7 @@ use std::{
     ffi::OsString,
     fs::File,
     io::{self, IsTerminal, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -139,7 +139,7 @@ fn parse_flags(value: &str) -> Result<RegexFlags, String> {
     Ok(flags)
 }
 
-fn run_export(path: &PathBuf, options: &CliOptions, format: ExportFormat) -> io::Result<()> {
+fn run_export(path: &Path, options: &CliOptions, format: ExportFormat) -> io::Result<()> {
     let Some(pattern) = options.regex.as_deref() else {
         eprintln!("--export requires --regex");
         print_usage();

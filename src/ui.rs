@@ -129,7 +129,7 @@ fn draw_file_error(frame: &mut Frame<'_>, area: Rect, err: io::Error) {
     frame.render_widget(paragraph, area);
 }
 
-fn draw_match_map(frame: &mut Frame<'_>, area: Rect, app: &App, lines: &[TextLine]) {
+fn draw_match_map(frame: &mut Frame<'_>, area: Rect, app: &mut App, lines: &[TextLine]) {
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -138,10 +138,10 @@ fn draw_match_map(frame: &mut Frame<'_>, area: Rect, app: &App, lines: &[TextLin
     let mut marks = vec![' '; rows];
     let file_size = app.match_index.file_size.max(1);
 
-    for hit in &app.match_index.hits {
-        let row = ((hit.byte_offset.saturating_mul(rows as u64)) / file_size)
-            .min(rows.saturating_sub(1) as u64) as usize;
-        marks[row] = '\u{2588}';
+    for (row, marked) in app.match_index.match_map_rows(rows).into_iter().enumerate() {
+        if marked {
+            marks[row] = '\u{2588}';
+        }
     }
 
     let current_line = if app.collapse_matches {
@@ -153,7 +153,7 @@ fn draw_match_map(frame: &mut Frame<'_>, area: Rect, app: &App, lines: &[TextLin
         app.scroll_line
     };
 
-    if let Some(offset) = app.file.byte_offset_for_line(current_line) {
+    if let Ok(Some(offset)) = app.file.byte_offset_for_line(current_line) {
         let row = ((offset.saturating_mul(rows as u64)) / file_size)
             .min(rows.saturating_sub(1) as u64) as usize;
         if marks[row] == ' ' {

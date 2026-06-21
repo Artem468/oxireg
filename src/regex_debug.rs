@@ -152,27 +152,27 @@ fn group_ranges(line: &str, regex: &Regex) -> Vec<GroupRange> {
 
     for captures in regex.captures_iter(line) {
         if !has_capture_groups {
-            if let Some(matched) = captures.get(0) {
-                if matched.start() != matched.end() {
-                    ranges.push(GroupRange {
-                        start: matched.start(),
-                        end: matched.end(),
-                        group_index: 0,
-                    });
-                }
+            if let Some(matched) = captures.get(0)
+                && matched.start() != matched.end()
+            {
+                ranges.push(GroupRange {
+                    start: matched.start(),
+                    end: matched.end(),
+                    group_index: 0,
+                });
             }
             continue;
         }
 
         for group_index in 1..captures.len() {
-            if let Some(matched) = captures.get(group_index) {
-                if matched.start() != matched.end() {
-                    ranges.push(GroupRange {
-                        start: matched.start(),
-                        end: matched.end(),
-                        group_index,
-                    });
-                }
+            if let Some(matched) = captures.get(group_index)
+                && matched.start() != matched.end()
+            {
+                ranges.push(GroupRange {
+                    start: matched.start(),
+                    end: matched.end(),
+                    group_index,
+                });
             }
         }
     }
