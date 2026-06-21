@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/icon.png" alt="VeloGate logo" width="220">
+  <img src="assets/icon.png" alt="Oxireg logo" width="220">
 </p>
 It is built for the cases where browser tools stop being practical: huge logs, private data, remote shells, and workflows where sending text to a website is not acceptable.
 
